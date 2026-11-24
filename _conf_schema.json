@@ -1,0 +1,122 @@
+{
+  "max_images_24h": {
+    "type": "int",
+    "description": "每群默认上限（张 / 24 小时）",
+    "default": 100,
+    "hint": "每个白名单群分别计数。未单独设置的群使用此值，0 表示暂停。"
+  },
+  "groups": {
+    "type": "template_list",
+    "description": "群白名单",
+    "default": [],
+    "hint": "每个允许绘图的群添加一条。删除条目并保存后，该群即失去绘图权限。",
+    "templates": {
+      "group": {
+        "name": "白名单群",
+        "display_item": "nickname",
+        "items": {
+          "nickname": {
+            "type": "string",
+            "description": "群昵称（选填）",
+            "default": "",
+            "hint": "给自己看的群备注，例如「插画交流群」。"
+          },
+          "group_id": {
+            "type": "string",
+            "description": "群标识",
+            "default": "",
+            "hint": "在对应的 QQ 群里 @机器人 发送 /群标识，复制返回的群标识。每群只填一条。"
+          },
+          "limit": {
+            "type": "string",
+            "description": "本群上限（张 / 24 小时）",
+            "default": "",
+            "hint": "留空使用每群默认上限；填 0 暂停；填正整数单独设置本群上限。"
+          },
+          "gallery_admins": {
+            "type": "text",
+            "description": "图库管理员",
+            "default": "",
+            "hint": "通常留空，自动识别群主和管理员。QQ 无法返回角色时，允许下列用户管理本群图库及提示词记录。每行填写一位管理员在本群发送 /群标识 得到的用户标识。QQ 明确返回普通成员时，以 QQ 为准。"
+          }
+        }
+      }
+    }
+  },
+  "group_id": {
+    "type": "text",
+    "description": "群白名单",
+    "default": "",
+    "hint": "每行一个群标识。保留旧版已填的群；留空不开放。",
+    "invisible": true
+  },
+  "group_quotas": {
+    "type": "template_list",
+    "description": "指定群上限",
+    "default": [],
+    "hint": "需要不同额度时，每群添加一条。删除该条后恢复默认上限，已用张数继续保留。",
+    "templates": {
+      "group": {
+        "name": "群额度",
+        "display_item": "group_id",
+        "items": {
+          "group_id": {
+            "type": "string",
+            "description": "群标识",
+            "hint": "粘贴在该群发送 /群标识 得到的群标识。群需已在白名单中。",
+            "default": ""
+          },
+          "limit": {
+            "type": "int",
+            "description": "24 小时上限（张）",
+            "hint": "填写非负整数。0 只暂停这个群。",
+            "default": 100
+          }
+        }
+      }
+    },
+    "invisible": true
+  },
+  "blocked_users": {
+    "type": "text",
+    "description": "用户黑名单",
+    "default": "",
+    "hint": "每行一个用户标识，或用逗号分隔。"
+  },
+  "api_token": {
+    "type": "string",
+    "description": "NovelAI Persistent API Token",
+    "default": "",
+    "hint": "也可在环境变量 NOVELAI_TOKEN 中配置。"
+  },
+  "buttons": {
+    "type": "bool",
+    "description": "发送 QQ 按钮菜单",
+    "default": true,
+    "hint": ""
+  },
+  "markdown_id": {
+    "type": "string",
+    "description": "Markdown 模板 ID（可选）",
+    "default": "",
+    "hint": ""
+  },
+  "markdown_key": {
+    "type": "string",
+    "description": "模板正文字段名",
+    "default": "text",
+    "hint": ""
+  },
+  "keyboard_id": {
+    "type": "string",
+    "description": "QQ 按钮模板 ID（可选）",
+    "default": "",
+    "hint": ""
+  },
+  "member_tokens": {
+    "type": "text",
+    "description": "按群成员分别使用官方 Token（可选）",
+    "hint": "每行 用户标识=环境变量名。填写后仅使用对应成员的变量，缺失时不回退到公共 Token。环境变量的值在 VPS 设置。",
+    "default": ""
+  }
+}

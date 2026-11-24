@@ -1,0 +1,13 @@
+# AstrBot local state and credentials
+.env*
+data/
+config/
+*.sqlite*
+*.db*
+*.log
+*.pem
+*.key
+*.zip
+__pycache__/
+*.py[cod]
+.venv/
