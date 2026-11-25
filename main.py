@@ -22,6 +22,7 @@ from .menu import Draft, ENTRY, FIELD, HELP, HELP_MARKDOWN, MULTILINE_EDIT, butt
 from .quota import Budget, group_limit, matching_groups, migrate_groups
 from .drafts import Drafts, GroupMember
 from .presets import Presets
+from .references import reference_parameters
 from .qq_image import send_image_card
 from .gallery import Gallery
 from .qq_gallery import release_event_roles, require_group_admin, retain_event_roles, send_archive
@@ -118,7 +119,8 @@ class NovelAIGroupDraw(Star):
             notice = "出图预设：" + " → ".join(p["name"] for p in enabled)
             text += "\n" + notice
             markdown += "\n\n" + markdown_text(notice)
-        await self.menu(event, text, markdown, rows)
+        hint = "附图出图可选角色、画风、服装或角色+画风。无图直接发送即可。"
+        await self.menu(event, text, markdown + "\n\n" + hint, rows)
 
     async def menu(self, event, message, paragraphs, rows=None, *, draft_menu=True, all_commands=False):
         send = getattr(getattr(getattr(event, "bot", None), "api", None), "post_group_message", None)
@@ -285,7 +287,8 @@ class NovelAIGroupDraw(Star):
                 draft.presets = self.presets.snapshot(owner)
                 draft.original_request = None
             key = hashlib.sha256(json.dumps(receipt).encode()).hexdigest()
-            images = await self.request_image(event, draft, key, owner.group_scope, acknowledge=True)
+            images = await self.request_image(event, draft, key, owner.group_scope, acknowledge=True,
+                                              reference_body=body if action == "出图" else None)
             image = images[0]
             try:
                 await asyncio.to_thread(Gallery(self.gallery_root, owner.group_scope).save, key, images)
@@ -367,7 +370,7 @@ class NovelAIGroupDraw(Star):
         except Exception as notice_error:
             log.warning("groupdraw %s: failure notice failed (%s)", key[:12], type(notice_error).__name__)
 
-    async def request_image(self, event, draft, key, group_scope, acknowledge):
+    async def request_image(self, event, draft, key, group_scope, acknowledge, reference_body=None):
         user = str(event.get_sender_id() or "")
         group = str(event.get_group_id() or "")
         if (not user or user in identifiers(self.config.get("blocked_users"))
@@ -400,6 +403,8 @@ class NovelAIGroupDraw(Star):
                 raise ValueError("额度记录暂时不可用，请稍后再试。") from error
             try:
                 payload = build_request(draft.effective().drawing(), draft.original_request)
+                if reference_body is not None:
+                    payload["parameters"].update(await reference_parameters(event, reference_body))
                 draft.original_request = payload
                 if acknowledge:
                     params = payload["parameters"]

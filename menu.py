@@ -156,7 +156,7 @@ class Draft:
             rows.append([edit(f"角色{i}正向"), edit(f"角色{i}负向"), ("删除", f"/删除角色 {i}")])
         target = "横图" if self.direction == "竖图" else "竖图"
         rows.append([(target, "/" + target),
-                     ("出图", "/出图"), ("清空", "/清空草稿")])
+                     ("出图", "/出图 参考模式：角色"), ("清空", "/清空草稿")])
         if len(roles) > 3:
             rows[-1].append(("上一页", "/草稿 1") if start else ("下一页", "/草稿 2"))
         suffix = f"的草稿：{self.direction}"
