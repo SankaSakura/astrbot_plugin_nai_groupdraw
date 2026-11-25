@@ -6,8 +6,6 @@ import math
 import re
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
-from time import time
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -32,7 +30,23 @@ def attachment_urls(attachments):
 
 def raw_message(event):
     raw = getattr(event.message_obj, "raw_message", None)
+    # AstrBot's QQ adapter exposes msg_elements on the model, but keeps the
+    # message_scene containing the matching ref_msg_idx in the original data.
+    payload = field(raw, "raw_data")
+    if isinstance(payload, dict) and payload:
+        raw = payload
     return field(raw, "d") or raw
+
+
+def quote_ids(raw):
+    ref_id = field(field(raw, "message_reference"), "message_id")
+    ext = field(field(raw, "message_scene"), "ext") or []
+    if isinstance(ext, dict):
+        ref_idx = ext.get("ref_msg_idx")
+    else:
+        ref_idx = next((s.partition("=")[2] for s in ext
+                        if isinstance(s, str) and s.startswith("ref_msg_idx=")), None)
+    return ref_id, ref_idx
 
 
 def image_urls(event):
@@ -40,7 +54,7 @@ def image_urls(event):
     urls = attachment_urls(field(raw, "attachments"))
     # A flattened chain can contain a quoted image indistinguishable from a
     # current attachment. Prefer its actual envelope on reply events.
-    if urls or field(raw, "msg_elements") or field(raw, "message_reference") or str(field(raw, "message_type")) == "103":
+    if urls or field(raw, "msg_elements") or str(field(raw, "message_type")) == "103" or any(quote_ids(raw)):
         return urls
     return component_images(getattr(event.message_obj, "message", []))
 
@@ -51,36 +65,21 @@ def component_images(parts):
             for part in parts or [] if isinstance(part, QQImage)]
 
 
-def sent_at(value):
-    try:
-        if isinstance(value, str) and not value.isdecimal():
-            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return dt.timestamp() if dt.tzinfo else None
-        stamp = float(value)
-        return stamp / 1000 if stamp > 10**12 else stamp
-    except (TypeError, ValueError, OverflowError, OSError):
-        return None
-
-
 @dataclass
 class QuotedImage:
     urls: list
     problem: str
     explicit: bool
+    located: bool = False
 
 
 def inspect_quote(event):
     raw = raw_message(event)
-    ref_id = field(field(raw, "message_reference"), "message_id")
-    ext = field(field(raw, "message_scene"), "ext") or []
-    if isinstance(ext, dict):
-        ref_idx = ext.get("ref_msg_idx")
-    else:
-        ref_idx = next((s.partition("=")[2] for s in ext
-                        if isinstance(s, str) and s.startswith("ref_msg_idx=")), None)
+    ref_id, ref_idx = quote_ids(raw)
     elements = field(raw, "msg_elements") or []
     if not (ref_id or ref_idx):
-        detail = "仅收到上下文，无法确认你回复了哪条消息。" if elements else "未收到可定位的引用，请长按图片选「回复」后再 @机器人。"
+        detail = ("收到消息上下文，但没有原消息 ID 或引用索引，无法定位原图。" if elements
+                  else "未收到可定位的引用，请长按图片选「回复」后再 @机器人。")
         return QuotedImage([], detail, False)
     targets = [e for e in elements if
                (ref_idx and field(e, "msg_idx") == ref_idx) or
@@ -94,14 +93,9 @@ def inspect_quote(event):
                and field(part, "id") and field(part, "id") in (ref_id, ref_idx)]
     reply = replies[0] if len(replies) == 1 else None
     if len(targets) > 1 or (not targets and reply is None):
-        return QuotedImage([], "QQ 提供了引用索引，但未返回可唯一匹配的原消息。", bool(ref_id))
+        return QuotedImage([], "QQ 提供了引用索引，但未返回可唯一匹配的原消息。", True)
     target = targets[0] if targets else None
     urls = attachment_urls(field(target, "attachments")) or component_images(field(reply, "chain"))
-    author = field(target, "author")
-    owner = field(author, "member_openid") or field(author, "id") or field(target, "sender_id") or field(reply, "sender_id")
-    stamp = sent_at(field(target, "timestamp") or field(target, "time") or field(reply, "time") or None)
-    current_author = field(raw, "author")
-    sender_ids = (str(event.get_sender_id()), field(current_author, "member_openid"), field(current_author, "id"))
     issues = []
     if not urls:
         issues.append("引用内容没有结构化图片附件")
@@ -110,15 +104,7 @@ def inspect_quote(event):
     original_group = field(target, "group_openid")
     if original_group and original_group != event.get_group_id():
         issues.append("原图来自其他群")
-    if not owner or owner == "0":
-        issues.append("缺少原作者")
-    elif owner not in sender_ids:
-        issues.append("原图并非本人发送")
-    if stamp is None:
-        issues.append("缺少可核对的原消息时间")
-    elif not 0 <= time() - stamp <= 120:
-        issues.append("原消息时间不在最近两分钟内")
-    return QuotedImage(urls, "，".join(issues), bool(ref_id))
+    return QuotedImage(urls, "，".join(issues), True, located=True)
 
 
 def reference_mode(body):

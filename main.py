@@ -174,7 +174,7 @@ class NovelAIGroupDraw(Star):
             if not text:
                 from astrbot.api.message_components import Plain
                 text = "".join(p.text for p in event.message_obj.message if isinstance(p, Plain)).strip()
-            if not re.match(r"^[/／]?(?:测试引用|引用出图|出图)(?=\s|$)", text):
+            if not re.match(r"^[/／]?(?:测试引用|出图)(?=\s|$)", text):
                 return
         match = re.match(ENTRY, text)
         if not group or not user or not match:
@@ -215,13 +215,14 @@ class NovelAIGroupDraw(Star):
             if action == "测试引用":
                 quote = inspect_quote(event)
                 if quote.problem:
-                    await say(f"引用测试：识别到 {len(quote.urls)} 个引用图片附件。{quote.problem}")
+                    result = f"已定位原消息，识别到 {len(quote.urls)} 个图片附件。" if quote.located else ""
+                    await say(f"引用测试：{result}{quote.problem.rstrip('。')}。")
                 else:
                     if self.lock.locked():
                         raise ValueError("机器人正在处理图片，请稍后再测试。")
                     async with self.lock:
                         await reference_parameters(quote.urls, "")
-                    await say(f"引用测试通过：已读取本人两分钟内的 {len(quote.urls)} 张图片。请再次回复原图发送 /引用出图 参考模式：服装。")
+                    await say(f"引用测试通过：已读取原消息中的 {len(quote.urls)} 张图片。请再次回复原图发送 /出图 参考模式：服装。")
                 return
             if action == "预设":
                 await self.menu(event, *self.presets.command(owner, body), draft_menu=False, all_commands=True)
@@ -286,7 +287,7 @@ class NovelAIGroupDraw(Star):
                 _, epoch = self.drafts.edit(owner)
                 from_card = bool(body) and action in ("原设置重画", "我的预设重画")
                 draft = self.drafts.recipe(owner, body, shared=from_card)
-            elif action in ("出图", "引用出图"):
+            elif action == "出图":
                 draft, epoch = self.drafts.edit(owner)
             else:
                 direction = DIRECTIONS.get(action) or (DIRECTIONS.get(body) if action == "画图" else None)
@@ -312,8 +313,7 @@ class NovelAIGroupDraw(Star):
                 draft.original_request = None
             key = hashlib.sha256(json.dumps(receipt).encode()).hexdigest()
             images = await self.request_image(event, draft, key, owner.group_scope, acknowledge=True,
-                                              reference_body=body if action in ("出图", "引用出图") else None,
-                                              require_quote=action == "引用出图")
+                                              reference_body=body if action == "出图" else None)
             image = images[0]
             try:
                 await asyncio.to_thread(Gallery(self.gallery_root, owner.group_scope).save, key, images)
@@ -395,7 +395,7 @@ class NovelAIGroupDraw(Star):
         except Exception as notice_error:
             log.warning("groupdraw %s: failure notice failed (%s)", key[:12], type(notice_error).__name__)
 
-    async def request_image(self, event, draft, key, group_scope, acknowledge, reference_body=None, require_quote=False):
+    async def request_image(self, event, draft, key, group_scope, acknowledge, reference_body=None):
         user = str(event.get_sender_id() or "")
         group = str(event.get_group_id() or "")
         if (not user or user in identifiers(self.config.get("blocked_users"))
@@ -429,11 +429,11 @@ class NovelAIGroupDraw(Star):
             try:
                 payload = build_request(draft.effective().drawing(), draft.original_request)
                 if reference_body is not None:
-                    urls = [] if require_quote else image_urls(event)
+                    urls = image_urls(event)
                     source = "本条附图"
                     if not urls:
                         quote = inspect_quote(event)
-                        if require_quote or quote.explicit:
+                        if quote.explicit:
                             if quote.problem:
                                 raise ValueError("引用图片不可用：" + quote.problem + "。本次未出图。")
                             urls = quote.urls
