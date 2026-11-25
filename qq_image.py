@@ -21,7 +21,7 @@ async def put_png(url, image):
             return response.headers["ETag"].strip('"')
 
 
-async def send_image_card(api, group, member, message_id, image, size, code):
+async def send_image_card(api, group, member, message_id, image, size, code, *, dm=None):
     from botpy.http import Route
 
     request = api._http.request
@@ -37,16 +37,18 @@ async def send_image_card(api, group, member, message_id, image, size, code):
     image_id = material["image_id"]
     try:
         width, height = size
-        text = (f'<qqbot-at-user id="{escape(str(member), quote=True)}" />\n\n'
-                f'![绘图 #{width}px #{height}px]({material["url"]})')
+        text = f'![绘图 #{width}px #{height}px]({material["url"]})'
+        if not dm:
+            text = f'<qqbot-at-user id="{escape(str(member), quote=True)}" />\n\n' + text
         keyboard = button_payload([
             [("按原设置重画", "/原设置重画 " + code), ("用我的预设重画", "/我的预设重画 " + code)],
             [("查看提示词", "/查看提示词 " + code)],
         ])
-        result = await api.post_group_message(
-            group_openid=group, msg_type=2, msg_id=message_id, msg_seq=2,
-            markdown={"content": text}, keyboard=keyboard,
-        )
+        payload = dict(msg_type=2, msg_id=message_id, msg_seq=2, markdown={"content": text}, keyboard=keyboard)
+        if dm:
+            result = await request(Route("POST", f"/v2/users/{quote(dm, safe='')}/messages"), json=payload)
+        else:
+            result = await api.post_group_message(group_openid=group, **payload)
         if result is None:
             raise ValueError("QQ 未确认图片卡片送达")
     finally:

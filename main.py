@@ -7,9 +7,12 @@ import json
 import sqlite3
 import uuid
 import re
+import secrets
 import shutil
 import time
 import zipfile
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import aiohttp
 from astrbot.api.event import AstrMessageEvent, filter
@@ -25,8 +28,9 @@ from .drafts import Drafts, GroupMember
 from .presets import Presets
 from .references import MODES, image_urls, inspect_quote, raw_message, reference_parameters
 from .qq_image import send_image_card
+from .bindings import Bindings
 from .gallery import Gallery
-from .qq_gallery import field as message_field, release_event_roles, require_group_admin, retain_event_roles, send_archive
+from .qq_gallery import field as message_field, qq_request, release_event_roles, require_group_admin, retain_event_roles, send_archive
 
 class Rejected(ValueError):
     """Upstream confirmed it did not accept the request."""
@@ -88,6 +92,8 @@ class NovelAIGroupDraw(Star):
         self.exporting = None
         self.budget = Budget(data / "budget.sqlite3")
         self.drafts = Drafts(data / "drafts.sqlite3")
+        self.bindings = Bindings(self.drafts.transaction)
+        self.clear_requests = {}
         self.presets = Presets(self.drafts.transaction)
         self.deepseek = DeepSeek(self.drafts)
         self.group_user_model = retain_event_roles()
@@ -117,7 +123,7 @@ class NovelAIGroupDraw(Star):
                         and not re.fullmatch(r"[a-fA-F0-9]{32}", candidate)):
                     name = candidate
                     break
-        text, markdown, rows = draft.panel(name, mention_id=member, **options)
+        text, markdown, rows = draft.panel(name, mention_id=None if owner.private else member, **options)
         enabled = self.presets.snapshot(owner)
         if enabled:
             notice = "出图预设：" + " → ".join(p["name"] for p in enabled)
@@ -129,9 +135,11 @@ class NovelAIGroupDraw(Star):
         await self.menu(event, text + "\n" + plain_hint, markdown + "\n\n" + hint, rows)
 
     async def menu(self, event, message, paragraphs, rows=None, *, draft_menu=True, all_commands=False):
-        send = getattr(getattr(getattr(event, "bot", None), "api", None), "post_group_message", None)
+        api = getattr(getattr(event, "bot", None), "api", None)
+        group = event.get_group_id()
+        dm = None if group else self.dm_id(event)
         mid = getattr(getattr(event, "message_obj", None), "message_id", None)
-        if send and mid and (rows is None or self.config.get("buttons", True)):
+        if api and mid and (group or dm) and (rows is None or self.config.get("buttons", True)):
             markdown = {"content": paragraphs}
             if self.config.get("markdown_id"):
                 markdown = {"custom_template_id": self.config["markdown_id"], "params": [
@@ -141,8 +149,11 @@ class NovelAIGroupDraw(Star):
                 template = self.config.get("keyboard_id") if draft_menu else None
                 extra["keyboard"] = {"id": template} if template else button_payload(rows)
             try:
-                await send(group_openid=event.get_group_id(), msg_type=2, msg_id=mid, msg_seq=1,
-                           markdown=markdown, **extra)
+                payload = dict(msg_type=2, msg_id=mid, msg_seq=1, markdown=markdown, **extra)
+                if dm:
+                    await qq_request(api, "POST", f"/v2/users/{quote(dm, safe='')}/messages", json=payload)
+                else:
+                    await api.post_group_message(group_openid=group, **payload)
                 return
             except Exception as error:
                 logging.getLogger(__name__).info("QQ menu fallback (%s)", type(error).__name__)
@@ -155,7 +166,7 @@ class NovelAIGroupDraw(Star):
     @filter.regex(r"(?i)^[/／]?help\s*$", priority=100)
     async def drawing_help(self, event: AstrMessageEvent):
         group = str(event.get_group_id() or "")
-        if not group:
+        if not group and not self.dm_id(event):
             return
         if event.message_str.strip().lower() == "help" and not event.is_at_or_wake_command:
             return
@@ -188,42 +199,142 @@ class NovelAIGroupDraw(Star):
                 return
         ds = re.match(DS_ENTRY, text)
         match = ds or re.match(ENTRY, text)
-        if not group or not user or not match:
+        if not user or not match:
+            return
+        if not group and match.group(1) != "标识" and not self.dm_id(event):
             return
         event.should_call_llm(False)
         try:
             action = ("DS" if ds else "") + match.group(1)
-            await self.handle(event, group, user, action, text[match.end():].strip())
+            try:
+                await self.handle(event, group, user, action, text[match.end():].strip())
+            except ValueError as error:
+                await event.send(event.plain_result(str(error)))
+            except sqlite3.Error:
+                await event.send(event.plain_result("绘图数据暂不可用，请稍后重试。"))
         finally:
             event.stop_event()
 
+    @staticmethod
+    def dm_id(event):
+        if not getattr(event, "message_obj", None):
+            return None
+        value = message_field(message_field(raw_message(event), "author"), "user_openid")
+        return value if isinstance(value, str) and value else None
+
+    def group_name(self, group):
+        rules = matching_groups(self.config, group)
+        return (rules[0].get("nickname") if rules else None) or group
+
+    @staticmethod
+    def expiry(timestamp):
+        return datetime.fromtimestamp(timestamp, timezone(timedelta(hours=8))).strftime("%m-%d %H:%M（北京时间）")
+
+    def check_binding(self, binding, dm):
+        owner = binding.owner
+        blocked = identifiers(self.config.get("blocked_users"))
+        if (not matching_groups(self.config, owner.group) or dm in blocked or owner.user in blocked or
+                self.bindings.get(owner.platform, owner.bot, dm) != binding):
+            raise ValueError("绑定已变化、到期或权限已撤销，请在目标群重新发送 /绑定群。")
+
     async def handle(self, event, group, user, action, body):
-        if user in identifiers(self.config.get("blocked_users")):
+        say = lambda message: event.send(event.plain_result(message))
+        dm = None if group else self.dm_id(event)
+        blocked = identifiers(self.config.get("blocked_users"))
+        if user in blocked or dm in blocked:
             return
-        if action == "群标识":
-            await event.send(event.plain_result(f"当前群标识 {group}\n你的用户标识 {user}"))
+        if action == "标识":
+            if body:
+                await event.send(event.plain_result("请单独发送 /标识。"))
+                return
+            if group:
+                message = f"当前群标识 {group}"
+            else:
+                message = f"你的用户标识 {dm}" if dm else "未能读取你的 QQ 私聊标识。"
+            await event.send(event.plain_result(message))
             return
         if action == "画图" and body == "身份":
-            await event.send(event.plain_result("该指令已更名，请发送 /群标识。"))
+            await event.send(event.plain_result("该指令已更名，请发送 /标识。"))
             return
         if action == "画图" and body in ("帮助", "help"):
             await self.menu(event, HELP, HELP_MARKDOWN)
             return
+        origin = str(event.unified_msg_origin).split(":", 1)[0]
+        bot = str(event.get_self_id() or "")
+        mid = getattr(event.message_obj, "message_id", None)
+        owner = GroupMember(origin, bot, group, user)
+        binding = None
+        if not group and not dm:
+            raise ValueError("未能核实 QQ 私聊身份。")
+        if action in ("绑定群", "绑定码", "解绑群", "当前绑定"):
+            if not bot or not mid:
+                raise ValueError("缺少机器人或消息标识，请重新发送。")
+            command_id = json.dumps([origin,bot,group,dm or user,str(mid)])
+            if action == "绑定群":
+                if not group or not matching_groups(self.config, group):
+                    raise ValueError("请在白名单群里 @机器人 发送 /绑定群。")
+                raw = raw_message(event)
+                author = message_field(raw,"author")
+                member = message_field(author,"member_openid")
+                if not member or message_field(raw,"group_openid") != group or user not in (member,message_field(author,"id")):
+                    raise ValueError("未能核实本条 QQ 群消息的发送者。")
+                if member in blocked:
+                    return
+                expires = self.bindings.bind(owner,member,body,command_id,blocked)
+                await say(f"已绑定到「{self.group_name(group)}」，有效至 {self.expiry(expires)}。私聊出图计入该群额度。")
+            elif group or body:
+                raise ValueError(f"请私聊单独发送 /{action}。")
+            elif action == "解绑群":
+                self.bindings.unbind(origin,bot,dm,command_id)
+                await say("已解除当前绑定。")
+            elif action == "绑定码":
+                code = self.bindings.pairing_code(origin,bot,dm,command_id)
+                await say(f"请本人在目标群 @机器人发送 /绑定群 {code}，5 分钟内有效。")
+            else:
+                binding = self.bindings.get(origin,bot,dm)
+                if binding:
+                    self.check_binding(binding,dm)
+                await say(f"当前绑定「{self.group_name(binding.owner.group)}」，有效至 {self.expiry(binding.expires)}。"
+                          if binding else "当前没有有效绑定。请在目标群发送 /绑定群。")
+            return
+        if dm:
+            binding = self.bindings.get(origin,bot,dm)
+            if not binding:
+                raise ValueError("请在目标群发送 /绑定群，有效期 48 小时。已绑定但仍提示时，私聊发送 /绑定码。")
+            self.check_binding(binding,dm)
+            owner = binding.owner
+            group, user = owner.group, owner.user
+            if action in ("图库权限","清空图库","导出图库","清空全群提示词记录"):
+                raise ValueError("群管理操作请在绑定群中执行。")
         group_entries = matching_groups(self.config, group)
         if not group_entries:
             await event.send(event.plain_result("这个群尚未加入绘图白名单。"))
             return
-        origin = str(event.unified_msg_origin).split(":", 1)[0]
-        owner = GroupMember(origin, str(event.get_self_id() or ""), group, user)
-        mid = getattr(event.message_obj, "message_id", None)
         receipt = (owner.history_owner, group, str(mid or uuid.uuid4()))
+        if dm:
+            receipt = (origin, bot, "dm", dm, receipt[-1])
         now = time.monotonic()
         self.seen = {key: until for key, until in self.seen.items() if until > now}
         if receipt in self.seen:
             return
         self.seen[receipt] = now + 600
-        say = lambda message: event.send(event.plain_result(message))
         try:
+            if action in ("导出我的私聊图库","清空我的私聊图库","清空我的私聊提示词记录"):
+                if not dm:
+                    raise ValueError("请在与机器人的私聊中操作个人私聊记录。")
+                if action != "清空我的私聊图库" and body:
+                    raise ValueError(f"请单独发送 /{action}。")
+                gallery = Gallery(self.gallery_root, owner.group_scope, owner.user)
+                if action == "导出我的私聊图库":
+                    api = getattr(getattr(event, "bot", None), "api", None)
+                    if not api or not mid:
+                        raise ValueError("未取得 QQ 私聊文件发送接口或消息标识，请重新发送。")
+                    await self.export_gallery(event, api, owner, mid, gallery, binding=binding, dm=dm)
+                elif action == "清空我的私聊提示词记录":
+                    await say(f"已清除 {self.drafts.clear_private_history(owner)} 条个人私聊提示词和重画记录。")
+                else:
+                    await self.clear_private_gallery(event, binding, dm, gallery, body)
+                return
             if action == "测试引用":
                 quote = inspect_quote(event)
                 if quote.problem:
@@ -239,16 +350,16 @@ class NovelAIGroupDraw(Star):
             if action == "预设":
                 await self.menu(event, *self.presets.command(owner, body), draft_menu=False, all_commands=True)
                 return
-            if action in ("图库权限", "导出图库", "清空图库", "清空提示词记录"):
+            if action in ("图库权限", "导出图库", "清空图库", "清空全群提示词记录"):
                 if body:
                     await say(f"请单独发送 /{action}。")
                     return
                 api, permission = await require_group_admin(
                     event, group, user, group_entries, self.config.get("global_admins"))
                 if action == "图库权限":
-                    await say(permission + "，可以导出图库、清空图库和清空提示词记录。")
+                    await say(permission + "，可以导出图库、清空图库和清空全群提示词记录。")
                     return
-                if action == "清空提示词记录":
+                if action == "清空全群提示词记录":
                     count = self.drafts.clear_group_history(owner)
                     await say(f"已清除本群 {count} 条提示词和重画记录。原图与个人草稿已保留。")
                     return
@@ -274,13 +385,6 @@ class NovelAIGroupDraw(Star):
                 draft, _ = self.drafts.edit(owner, replacement=Draft())
                 await self.show_draft(event, owner, draft)
                 return
-            if action == "清除记录":
-                if body:
-                    await say("请单独发送 /清除记录。")
-                    return
-                removed = self.drafts.clear_history(owner)
-                await say(f"已清除你在本群的 {removed} 条历史出图记录。当前草稿已保留。")
-                return
             if action in ("查看提示词", "覆盖草稿"):
                 parts = body.split()
                 code = parts[0] if parts else ""
@@ -304,6 +408,8 @@ class NovelAIGroupDraw(Star):
                     raise ValueError("无法取得本条消息标识，请重新发送 DS 指令。")
                 editing = action == "DS整理"
                 prepared = await self.deepseek.prepare(self.config, owner, body, editing, key)
+                if dm:
+                    self.check_binding(binding,dm)
                 if (not self.config.get("deepseek_enabled", False) or not matching_groups(self.config, group)
                         or user in identifiers(self.config.get("blocked_users"))):
                     raise ValueError("当前群或账号没有 DS 使用权限。")
@@ -340,11 +446,11 @@ class NovelAIGroupDraw(Star):
             if not original_settings and action != "DS出图":
                 draft.presets = self.presets.snapshot(owner)
                 draft.original_request = None
-            images = await self.request_image(event, draft, key, owner.group_scope, acknowledge=True,
-                                              reference_body=reference_body)
+            images = await self.request_image(event, draft, key, owner, acknowledge=True,
+                                              reference_body=reference_body, binding=binding, dm=dm)
             image = images[0]
             try:
-                await asyncio.to_thread(Gallery(self.gallery_root, owner.group_scope).save, key, images)
+                await asyncio.to_thread(Gallery(self.gallery_root, owner.group_scope, owner.user if dm else None).save, key, images)
             except (OSError, sqlite3.Error) as error:
                 logging.getLogger(__name__).error("groupdraw %s: gallery save failed (%s)", key[:12], type(error).__name__)
                 try:
@@ -367,7 +473,7 @@ class NovelAIGroupDraw(Star):
                 try:
                     await send_image_card(api, group, member or user,
                                           mid, image, (draft.original_request["parameters"]["width"],
-                                                       draft.original_request["parameters"]["height"]), code)
+                                                       draft.original_request["parameters"]["height"]), code, **({"dm":dm} if dm else {}))
                     return
                 except Exception as error:
                     if content_rejected(error):
@@ -376,6 +482,8 @@ class NovelAIGroupDraw(Star):
                     logging.getLogger(__name__).warning("groupdraw %s: QQ card fallback (%s)", key[:12], type(error).__name__)
             try:
                 await event.send(event.chain_result([Image.fromBytes(image)]))
+                if dm and code:
+                    await say(f"查看提示词：/查看提示词 {code}\n重画：/原设置重画 {code}")
             except Exception as error:
                 await self.delivery_notice(event, api, group, mid, key, error)
         except ValueError as error:
@@ -385,7 +493,29 @@ class NovelAIGroupDraw(Star):
 
 
 
-    async def export_gallery(self, event, api, owner, mid, gallery):
+    async def clear_private_gallery(self, event, binding, dm, gallery, body):
+        key = (binding.revision, dm)
+        now = time.monotonic()
+        self.clear_requests = {k:v for k,v in self.clear_requests.items() if v[0] > now}
+        if not body:
+            snapshot = await asyncio.to_thread(gallery.snapshot)
+            self.check_binding(binding,dm)
+            if not snapshot[0]:
+                raise ValueError("你的私聊图库是空的。")
+            token = secrets.token_hex(4)
+            self.clear_requests[key] = (now+120,token,snapshot)
+            text = (f"将删除你在「{self.group_name(binding.owner.group)}」的 {snapshot[0]} 张私聊原图。"
+                    f"两分钟内发送 /清空我的私聊图库 确认 {token}")
+        else:
+            pending = self.clear_requests.get(key)
+            if not pending or body != "确认 " + pending[1]:
+                raise ValueError("确认无效，请重新发送 /清空我的私聊图库。")
+            del self.clear_requests[key]
+            count = await asyncio.to_thread(gallery.clear, pending[2], lambda: self.check_binding(binding,dm))
+            text = f"已清空你的 {count} 张私聊原图。"
+        await event.send(event.plain_result(text))
+
+    async def export_gallery(self, event, api, owner, mid, gallery, *, binding=None, dm=None):
         if self.exporting is not None:
             raise ValueError("机器人正在导出图库，请稍后再试。")
         if not mid:
@@ -396,10 +526,18 @@ class NovelAIGroupDraw(Star):
             with output:
                 size = os.fstat(output.fileno()).st_size
                 try:
-                    await send_archive(api, owner.group, mid, output, size, f"本群图库-{count}张.zip")
+                    if dm:
+                        self.check_binding(binding,dm)
+                        await send_archive(api, owner.group, mid, output, size, f"我的私聊图库-{count}张.zip",
+                                           dm=dm, authorize=lambda: self.check_binding(binding,dm))
+                    else:
+                        await send_archive(api, owner.group, mid, output, size, f"本群图库-{count}张.zip")
                 except Exception as error:
                     logging.getLogger(__name__).warning("QQ gallery delivery failed (%s; %d bytes)",
                                                        type(error).__name__, size)
+                    if dm:
+                        self.check_binding(binding,dm)
+                        raise ValueError("QQ 未确认私聊文件送达，原图仍在你的私聊图库。") from error
                     raise ValueError(f"本群 {count} 张原图已打包（{size / 1048576:.1f} MiB），"
                                      "但 QQ 未确认文件送达。请检查群文件权限和单文件大小限制。原图仍在图库中。") from error
         finally:
@@ -413,7 +551,7 @@ class NovelAIGroupDraw(Star):
         log.warning("groupdraw %s: delivery failed (%s)", key[:12],
                     "QQ content rejected" if rejected else type(error).__name__)
         try:
-            if api and mid and hasattr(api, "post_group_message"):
+            if event.get_group_id() and api and mid and hasattr(api, "post_group_message"):
                 result = await api.post_group_message(group_openid=group, msg_id=mid, msg_seq=4,
                                                       msg_type=0, content=text)
                 if result is None:
@@ -423,9 +561,10 @@ class NovelAIGroupDraw(Star):
         except Exception as notice_error:
             log.warning("groupdraw %s: failure notice failed (%s)", key[:12], type(notice_error).__name__)
 
-    async def request_image(self, event, draft, key, group_scope, acknowledge, reference_body=None):
-        user = str(event.get_sender_id() or "")
-        group = str(event.get_group_id() or "")
+    async def request_image(self, event, draft, key, owner, acknowledge, reference_body=None, binding=None, dm=None):
+        user, group, group_scope = owner.user, owner.group, owner.group_scope
+        if dm:
+            self.check_binding(binding,dm)
         if (not user or user in identifiers(self.config.get("blocked_users"))
                 or not matching_groups(self.config, group)):
             raise ValueError("当前群或账号没有绘图权限。")
@@ -480,6 +619,8 @@ class NovelAIGroupDraw(Star):
                         else:
                             notice += " · 本条消息未收到参考图"
                     await event.send(event.plain_result(notice))
+                if dm:
+                    self.check_binding(binding,dm)
             except BaseException:
                 self.budget.release(key)
                 raise

@@ -88,7 +88,7 @@ async def require_group_admin(event, group, user, group_entries, global_admins=N
         raise ValueError("只有插件总管理员、本群群主或管理员可以执行此操作。")
     if len(group_entries) == 1 and user in identifiers(group_entries[0].get("gallery_admins")):
         return api, "你已获得本群手动授权的图库管理权限"
-    raise ValueError(f"{lookup_note}，操作未执行。可发送 /群标识，再请机器人管理员将你的用户标识填入本群的「图库管理员」并保存。")
+    raise ValueError(f"{lookup_note}，操作未执行。可私聊机器人发送 /标识，再请机器人管理员将你的用户标识填入本群的「图库管理员」并保存。")
 
 
 def file_hashes(file):
@@ -150,8 +150,8 @@ async def chunk_upload(api, path, file, size, name):
         "upload_id": upload, "file_type": 4, "file_name": name, "srv_send_msg": False})
 
 
-async def send_archive(api, group, mid, file, size, name):
-    path = f"/v2/groups/{quote(group, safe='')}"
+async def send_archive(api, group, mid, file, size, name, *, dm=None, authorize=None):
+    path = f"/v2/users/{quote(dm, safe='')}" if dm else f"/v2/groups/{quote(group, safe='')}"
     if size <= 5 * 1024 * 1024:
         encoded = base64.b64encode(file.read()).decode("ascii")
         result = await qq_request(api, "POST", path + "/files", json={
@@ -161,7 +161,12 @@ async def send_archive(api, group, mid, file, size, name):
     info = result.get("file_info")
     if not info:
         raise ValueError("QQ 未返回文件凭据。")
-    sent = await api.post_group_message(group_openid=group, msg_id=mid, msg_seq=1,
-                                        msg_type=7, media={"file_info": info})
+    if dm:
+        authorize()
+        sent = await qq_request(api, "POST", path + "/messages", json={
+            "msg_id": mid, "msg_seq": 1, "msg_type": 7, "content": " ", "media": {"file_info": info}})
+    else:
+        sent = await api.post_group_message(group_openid=group, msg_id=mid, msg_seq=1,
+                                            msg_type=7, media={"file_info": info})
     if not sent or not field(sent, "id"):
         raise ValueError("QQ 未确认文件消息。")

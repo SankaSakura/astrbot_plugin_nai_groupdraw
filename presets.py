@@ -166,13 +166,15 @@ class Presets:
             selected = self.selection(db, member)
             page = 1
             if verb in ("新建", "修改"):
+                if member.private:
+                    raise ValueError("请在绑定群里新建或修改共享预设。")
                 changes = parse_fields(lines[1:])
                 preset = self.save_group_preset(db, member, catalog, arg if verb == "修改" else None, arg, changes)
                 return self.detail(preset, selected)
             if len(lines) > 1:
                 raise ValueError("请每次发送一条预设指令。")
             if verb == "详情":
-                return self.detail(self.lookup(catalog, arg), selected)
+                return self.detail(self.lookup(catalog, arg), selected, private=member.private)
             if verb in ("启用", "停用", "全关"):
                 keys = [self.lookup(catalog, k).key for k in re.split(r"[\s,，]+", arg) if k]
                 if (verb == "全关" and keys) or (verb != "全关" and not keys):
@@ -184,10 +186,12 @@ class Presets:
                 if arg or not re.fullmatch(r"[1-9][0-9]{0,8}", verb):
                     raise ValueError("发送 /预设 打开列表，或用 /预设 详情 编号 查看内容。")
                 page = int(verb)
-            return self.panel(catalog, selected, page)
+            return self.panel(catalog, selected, page, private=member.private)
 
     @staticmethod
     def save_group_preset(db, member, catalog, key, name, changes):
+        if member.private:
+            raise ValueError("请在绑定群里新建或修改共享预设。")
         if key is None:
             preset = Preset("", name, "", "")
         else:
@@ -232,7 +236,7 @@ class Presets:
         return preset
 
     @staticmethod
-    def detail(preset, selected):
+    def detail(preset, selected, private=False):
         enabled = preset.key in selected
         action = "停用" if enabled else "启用"
         title = f"{preset.key} · {preset.name}"
@@ -243,13 +247,13 @@ class Presets:
             plain.append(label + "：" + (value or "（空）"))
             md.append(label + "：" + (tag_markdown(value) if value else "（空）"))
         row = [(action, f"/预设 {action} {preset.key}"), ("预设列表", "/预设")]
-        if preset.key not in OFFICIAL:
+        if preset.key not in OFFICIAL and not private:
             row.append(("编辑预设", f"/预设 修改 {preset.key}\n昵称：{preset.name}\n"
                         f"正向：{preset.positive}\n反向：{preset.negative}"))
         return "\n".join(plain + [status]), "\n\n".join(md + [status]), [row]
 
     @staticmethod
-    def panel(catalog, selected, page):
+    def panel(catalog, selected, page, private=False):
         total = (len(catalog) + 3) // 4
         if page > total:
             raise ValueError(f"预设只有 {total} 页。")
@@ -262,6 +266,8 @@ class Presets:
             rows.append([(action + " " + p.key, f"/预设 {action} {p.key}"),
                          ("详情 " + p.key, f"/预设 详情 {p.key}")])
         nav = [("新建预设", "/预设 新建 我的画风\n正向：\n反向："), ("全关", "/预设 全关")]
+        if private:
+            nav = nav[1:]
         if page > 1:
             nav.append(("上一页", f"/预设 {page-1}"))
         if page < total:

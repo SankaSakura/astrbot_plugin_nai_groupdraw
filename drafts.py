@@ -14,6 +14,7 @@ class GroupMember:
     bot: str
     group: str
     user: str
+    private: bool = False
 
     @property
     def draft_key(self):
@@ -39,7 +40,10 @@ class Drafts:
                 db.execute("ALTER TABLE recipe ADD COLUMN group_scope TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS by_owner ON recipe(owner)")
             db.execute("CREATE INDEX IF NOT EXISTS by_recipe_group ON recipe(group_scope)")
+            if "private" not in {row[1] for row in db.execute("PRAGMA table_info(recipe)")}:
+                db.execute("ALTER TABLE recipe ADD COLUMN private INTEGER NOT NULL DEFAULT 0")
             db.execute("CREATE TABLE IF NOT EXISTS history_epoch (group_scope TEXT PRIMARY KEY, epoch INTEGER NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS private_history_epoch (owner TEXT PRIMARY KEY, epoch INTEGER NOT NULL)")
 
     @contextmanager
     def transaction(self):
@@ -76,7 +80,11 @@ class Drafts:
     @staticmethod
     def group_epoch(db, member):
         row = db.execute("SELECT epoch FROM history_epoch WHERE group_scope=?", (member.group_scope,)).fetchone()
-        return row[0] if row else 0
+        epoch = row[0] if row else 0
+        if member.private:
+            personal = db.execute("SELECT epoch FROM private_history_epoch WHERE owner=?", (member.draft_key,)).fetchone()
+            return epoch, personal[0] if personal else 0
+        return epoch
 
     def clear_group_history(self, member):
         with self.transaction() as db:
@@ -86,12 +94,15 @@ class Drafts:
                        "ON CONFLICT(group_scope) DO UPDATE SET epoch=epoch+1", (member.group_scope,))
             return removed
 
-    def clear_history(self, member):
+    def clear_private_history(self, member):
+        if not member.private:
+            raise ValueError("请在私聊中清理个人私聊记录。")
         with self.transaction() as db:
-            removed = db.execute("DELETE FROM recipe WHERE owner=? AND group_scope=?",
+            removed = db.execute("DELETE FROM recipe WHERE owner=? AND group_scope=? AND private=1",
                                  (member.history_owner, member.group_scope)).rowcount
             # A request already in flight must not recreate the cleared history.
-            db.execute("UPDATE draft SET epoch=epoch+1 WHERE owner=?", (member.draft_key,))
+            db.execute("INSERT INTO private_history_epoch VALUES (?,1) ON CONFLICT(owner) "
+                       "DO UPDATE SET epoch=epoch+1", (member.draft_key,))
             return removed
 
     def remember(self, member, draft, epoch):
@@ -100,20 +111,22 @@ class Drafts:
             if not row or (row[0], self.group_epoch(db, member)) != epoch:
                 return None
             code = secrets.token_hex(6)
-            db.execute("INSERT INTO recipe (id,owner,data,group_scope) VALUES (?,?,?,?)",
-                       (code, member.history_owner, json.dumps(asdict(draft), ensure_ascii=False), member.group_scope))
+            db.execute("INSERT INTO recipe (id,owner,data,group_scope,private) VALUES (?,?,?,?,?)",
+                       (code, member.history_owner, json.dumps(asdict(draft), ensure_ascii=False), member.group_scope,member.private))
             return code
 
     def recipe(self, member, code, *, shared=False):
         with self.transaction() as db:
             if shared:
-                row = db.execute("SELECT data FROM recipe WHERE id=? AND group_scope=?", (code, member.group_scope)).fetchone()
+                row = db.execute("SELECT data FROM recipe WHERE id=? AND group_scope=? "
+                                 "AND (private=0 OR (private=? AND owner=?))",
+                                 (code, member.group_scope, member.private, member.history_owner)).fetchone()
             elif code:
-                row = db.execute("SELECT data FROM recipe WHERE owner=? AND group_scope=? AND id=?",
-                                 (member.history_owner, member.group_scope, code)).fetchone()
+                row = db.execute("SELECT data FROM recipe WHERE owner=? AND group_scope=? AND id=? AND private<=?",
+                                 (member.history_owner, member.group_scope, code, member.private)).fetchone()
             else:
-                row = db.execute("SELECT data FROM recipe WHERE owner=? AND group_scope=? ORDER BY rowid DESC LIMIT 1",
-                                 (member.history_owner, member.group_scope)).fetchone()
+                row = db.execute("SELECT data FROM recipe WHERE owner=? AND group_scope=? AND private=? ORDER BY rowid DESC LIMIT 1",
+                                 (member.history_owner, member.group_scope,member.private)).fetchone()
         if not row:
             if shared or code:
                 raise ValueError("找不到这张图的出图记录。记录可能不存在或已被删除。")

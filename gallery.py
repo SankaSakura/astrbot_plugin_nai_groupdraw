@@ -10,8 +10,11 @@ from contextlib import closing, contextmanager
 
 
 class Gallery:
-    def __init__(self, root, scope):
+    def __init__(self, root, scope, private_owner=None):
         self.path = Path(root) / hashlib.sha256(scope.encode()).hexdigest()
+        self.live = self.path / "images"
+        if private_owner is not None:
+            self.live = self.live / ".private" / hashlib.sha256(private_owner.encode()).hexdigest()
 
     @contextmanager
     def locked(self):
@@ -25,8 +28,8 @@ class Gallery:
     def save(self, key, images):
         batch = hashlib.sha256(key.encode()).hexdigest()
         with self.locked():
-            live = self.path / "images"
-            live.mkdir(exist_ok=True)
+            live = self.live
+            live.mkdir(parents=True, exist_ok=True)
             if (live / batch).exists():
                 return
             staging = self.path / ".pending"
@@ -44,10 +47,10 @@ class Gallery:
 
     def pack(self, output):
         with self.locked():
-            live = self.path / "images"
+            live = self.live
             files = sorted(live.glob("*/*.png"))
             if not files:
-                raise ValueError("本群图库是空的。")
+                raise ValueError("本群图库是空的。" if live == self.path / "images" else "你的私聊图库是空的。")
             # PNG is already compressed. Allow room for ZIP headers as well.
             required = sum(p.stat().st_size + 512 for p in files) + 128 * 1024 * 1024
             if shutil.disk_usage(self.path).free < required:
@@ -66,9 +69,21 @@ class Gallery:
             output.close()
             raise
 
-    def clear(self):
+    def snapshot(self):
         with self.locked():
-            live = self.path / "images"
+            return self._snapshot()
+
+    def _snapshot(self):
+        files = sorted(p.relative_to(self.live).as_posix() for p in self.live.glob("*/*.png"))
+        return len(files), hashlib.sha256("\n".join(files).encode()).hexdigest()
+
+    def clear(self, expected=None, authorize=None):
+        with self.locked():
+            if authorize:
+                authorize()
+            if expected is not None and self._snapshot() != expected:
+                raise ValueError("待删除的图片已变化，请重新发送 /清空我的私聊图库。")
+            live = self.live
             trash = self.path / ".deleting"
             staging = self.path / ".pending"
             if staging.exists():
@@ -77,7 +92,7 @@ class Gallery:
                 shutil.rmtree(trash)
             if not live.exists():
                 return 0
-            count = sum(1 for _ in live.glob("*/*.png"))
+            count = sum(1 for _ in live.rglob("*.png"))
             os.rename(live, trash)
             shutil.rmtree(trash)
             return count

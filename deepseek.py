@@ -23,15 +23,17 @@ COMMON = """你是 QQ 绘图插件的意图解析器，输出单个 JSON 对象�
 fields 是字段名到英文绘图提示词的对象，仅限画面正向/负向、角色1至6正向/负向；方向用 横图 或 竖图。
 预设按本群目录解析，禁止猜编号。预设由插件拼接，不要把预设原文重复写进 fields。所有未用的可选键都省略。"""
 EDIT = """只整理，不生成图片。结构示例 {"fields":{"角色1正向":"silver hair"},"direction":"横图","enable":["N2"],"disable":["N3"]}。
+shared_presets_read_only 为 true 时只允许编辑个人草稿和启用项，要求新建或修改共享预设时提示用户到群内操作。
 只有用户要求改变画幅时才填写 direction。只修改提示词时，省略画幅和其他未涉及的字段。
 fields 对给定栏是完整替换，按请求保留原栏其他内容；空字符串清除此栏。clear_selection 为 true 可全关，再启用 enable。
 明确创建共享预设时用 shared={"name":"名称","positive":"英文词","negative":"英文词"}；如需同时启用新项，在 enable 中用 NEW。
 只有 edit_target 有值且用户明确要求修改它时才用 shared={"key":"P3","positive":"更新后的词"}，只写变化的栏。
 用户想改共享预设但未明确目标，请提示以“修改本群预设 P编号”开头。不得用创建代替修改。"""
-DRAW = """仅生成这一次，不持久修改。示例 {"fields":{"画面正向":"a snowy railway station, watercolor"},"direction":"横图","presets":["N2"],"reference":"服装"}。
+DRAW = """仅生成这一次，不持久修改。示例 {"inherit":"all","fields":{"画面正向":"a snowy railway station, watercolor"}}。
 默认空白草稿、无预设。要求继承全部草稿时 inherit="all"，仅沿用指定栏时 inherit=["角色1正向","角色1负向"]。
 fields 覆盖本次字段；如需改动已继承字段，在该栏中保留用户未要求改变的内容。
-direction 可省略；沿用整份草稿时保留原画幅。presets 可填编号列表，或 "selected" 表示本人当前已启用的顺序。
+direction 可省略；沿用整份草稿时保留原画幅。使用当前草稿只需 inherit="all"。上下文没有 catalog 时省略 presets，不要追问预设。
+只有请求涉及预设时才填 presets，值为本群目录中的编号列表，或 "selected" 表示本人当前已启用的顺序。
 reference 可省略，或填 角色、画风、服装、角色+画风。附件由插件处理。至少提供一个绘图字段、画幅、继承项、预设或参考模式。"""
 
 def valid(condition, message="DeepSeek 返回的方案不符合指令格式，请换一种说法。"):
@@ -129,8 +131,15 @@ class DeepSeek:
                                          "WHERE scope=? AND at>?", (member.draft_key, member.group_scope, now-60)).fetchone()
             valid(personal < 4 and count < 20, "本分钟 DS 调用已达上限，请稍后重试。")
             db.execute("INSERT INTO ds_request VALUES (?,?,?,?)", (receipt,member.draft_key,member.group_scope,now))
-        catalog = {k:v.name for k,v in state.catalog.items()}
-        context = {"request": request, "catalog": catalog, "selected": state.selected, "edit_target": target}
+        context = {"request": request, "edit_target": target}
+        if member.private and editing:
+            valid(not target and not CREATE.search(body), "请在绑定群里新建或修改共享预设。")
+            context["shared_presets_read_only"] = True
+        use_presets = (editing or MENTIONED_PRESET.search(body) or re.search(r"预设|\bpresets?\b", body, re.I)
+                       or any(re.search(r"(?:用|套上|加上|搭配|按|use\s+)\s*[「“\"]?" + re.escape(p.name),
+                                        body, re.I) for p in state.catalog.values()))
+        if use_presets:
+            context.update(catalog={k:v.name for k,v in state.catalog.items()}, selected=state.selected)
         if editing or re.search(r"草稿|沿用|保留|之前|原来|当前角色|原角色|draft", body, re.I):
             context.update(direction=state.draft.direction, draft=state.draft.fields)
         if editing and target:
@@ -141,6 +150,8 @@ class DeepSeek:
         if "question" in plan:
             only(plan, ["question"])
             raise ValueError("DS：" + short(plan["question"], 300))
+        if not use_presets:
+            plan.pop("presets", None)
         return state, target, plan
 
     def execute(self, member, body, editing, prepared):

@@ -1,5 +1,5 @@
 name: astrbot_plugin_nai_groupdraw
 display_name: 群聊画图
 desc: QQ 群内使用画稿和按钮生成 NovelAI V5 Full 图片。
-version: v1.17.3
+version: v1.18.0
 author: VPS Project
