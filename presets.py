@@ -15,6 +15,18 @@ class Preset:
     negative: str
 
 
+class Catalog(dict):
+    """Display each preset once; resolve historical global numbers in this group only."""
+
+    def __init__(self):
+        super().__init__(OFFICIAL)
+        self.aliases = {}
+
+    def canonical(self, key):
+        key = key.upper()
+        return self.aliases.get(key, key)
+
+
 HEAVY = ("lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, "
          "very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, "
          "too many watermarks, negative space, blank page")
@@ -57,27 +69,40 @@ class Presets:
             db.execute("CREATE TABLE IF NOT EXISTS group_preset (id INTEGER PRIMARY KEY, scope TEXT NOT NULL, "
                        "name TEXT NOT NULL, positive TEXT NOT NULL, negative TEXT NOT NULL, UNIQUE(scope,name))")
             db.execute("CREATE TABLE IF NOT EXISTS preset_selection (owner TEXT PRIMARY KEY, keys TEXT NOT NULL)")
+            if "local_no" not in {row[1] for row in db.execute("PRAGMA table_info(group_preset)")}:
+                db.execute("ALTER TABLE group_preset ADD COLUMN local_no INTEGER NOT NULL DEFAULT 0")
+                db.execute("ALTER TABLE group_preset ADD COLUMN legacy_no INTEGER")
+                numbers = {}
+                for row_id, scope in db.execute("SELECT id,scope FROM group_preset ORDER BY id").fetchall():
+                    numbers[scope] = numbers.get(scope, 0) + 1
+                    db.execute("UPDATE group_preset SET local_no=?,legacy_no=id WHERE id=?", (numbers[scope], row_id))
+                db.execute("CREATE UNIQUE INDEX group_preset_local_no ON group_preset(scope,local_no)")
 
     @staticmethod
     def catalog(db, member):
-        presets = dict(OFFICIAL)
-        for number, name, pos, neg in db.execute("SELECT id,name,positive,negative FROM group_preset "
-                                                 "WHERE scope=? ORDER BY id", (member.group_scope,)):
-            key = f"G{number}"
+        presets = Catalog()
+        for number, old, name, pos, neg in db.execute(
+                "SELECT local_no,legacy_no,name,positive,negative FROM group_preset WHERE scope=? ORDER BY local_no",
+                (member.group_scope,)):
+            key = f"P{number}"
             presets[key] = Preset(key, name, pos, neg)
+            if old is not None:
+                presets.aliases[f"G{old}"] = key
         return presets
 
     @staticmethod
-    def selection(db, member):
+    def selection(db, member, catalog=None):
         row = db.execute("SELECT keys FROM preset_selection WHERE owner=?", (member.draft_key,)).fetchone()
-        return json.loads(row[0]) if row else []
+        if row is None:
+            return []
+        if catalog is None:
+            catalog = Presets.catalog(db, member)
+        return [catalog.canonical(key) for key in json.loads(row[0])]
 
     def snapshot(self, member):
         with self.transaction() as db:
-            keys = self.selection(db, member)
-            if not keys:
-                return []
             catalog = self.catalog(db, member)
+            keys = self.selection(db, member, catalog)
             return [asdict(catalog[key]) for key in keys]
 
     def history_panel(self, member, code, snapshot, options):
@@ -92,7 +117,6 @@ class Presets:
         if page > pages:
             raise ValueError("这张图没有这一页预设。")
         presets = snapshot.presets[(page-1)*per_page:page*per_page]
-        text, md = snapshot.history_text(presets, page, pages)
         command = "/查看提示词 " + code
         nav = [("覆盖草稿", "/覆盖草稿 " + code)]
         if page > 1:
@@ -102,9 +126,12 @@ class Presets:
         switches = []
         with self.transaction() as db:
             catalog = self.catalog(db, member)
-            selected = self.selection(db, member)
+            selected = self.selection(db, member, catalog)
+            presets = [dict(p, key=catalog.canonical(p["key"])) for p in presets]
+            text, md = snapshot.history_text(presets, page, pages)
             if len(options) == 4:
                 _, action, key, card_viewer = options
+                key = catalog.canonical(key)
                 if action not in ("开启", "关闭") or key not in {p["key"] for p in presets} or key not in catalog:
                     raise ValueError("这项预设不可用，请重新查看提示词。")
                 if card_viewer == viewer:
@@ -129,7 +156,7 @@ class Presets:
         arg = rest[0].strip() if rest else ""
         with self.transaction() as db:
             catalog = self.catalog(db, member)
-            selected = self.selection(db, member)
+            selected = self.selection(db, member, catalog)
             page = 1
             if verb in ("新建", "修改"):
                 changes = parse_fields(lines[1:])
@@ -166,12 +193,14 @@ class Presets:
         if any(p.name == preset.name and p.key != preset.key for p in catalog.values()):
             raise ValueError("本群已有同名预设，请换一个昵称。")
         if preset.key:
-            db.execute("UPDATE group_preset SET name=?,positive=?,negative=? WHERE scope=? AND id=?",
+            db.execute("UPDATE group_preset SET name=?,positive=?,negative=? WHERE scope=? AND local_no=?",
                        (preset.name, preset.positive, preset.negative, member.group_scope, preset.key[1:]))
         else:
-            row = db.execute("INSERT INTO group_preset(scope,name,positive,negative) VALUES (?,?,?,?)",
-                             (member.group_scope, preset.name, preset.positive, preset.negative))
-            preset = replace(preset, key=f"G{row.lastrowid}")
+            number, = db.execute("SELECT COALESCE(MAX(local_no),0)+1 FROM group_preset WHERE scope=?",
+                                 (member.group_scope,)).fetchone()
+            db.execute("INSERT INTO group_preset(scope,local_no,name,positive,negative) VALUES (?,?,?,?,?)",
+                       (member.group_scope, number, preset.name, preset.positive, preset.negative))
+            preset = replace(preset, key=f"P{number}")
         return preset
 
     @staticmethod
@@ -190,7 +219,7 @@ class Presets:
 
     @staticmethod
     def lookup(catalog, key):
-        preset = catalog.get(key.upper())
+        preset = catalog.get(catalog.canonical(key))
         if not preset:
             raise ValueError("本群没有这个预设编号。发送 /预设 查看列表。")
         return preset
