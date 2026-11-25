@@ -1,9 +1,9 @@
 import hashlib
-import logging
 from html import escape
 from urllib.parse import quote
 
 import aiohttp
+from astrbot.api import logger
 from yarl import URL
 
 from .menu import button_payload
@@ -56,4 +56,4 @@ async def send_image_card(api, group, member, message_id, image, size, code, *, 
         try:
             await request(Route("DELETE", f"{base}/{quote(image_id, safe='')}/delete"))
         except Exception as exc:
-            logging.getLogger(__name__).warning("QQ material cleanup failed (%s)", type(exc).__name__)
+            logger.warning(f"QQ material cleanup failed ({type(exc).__name__})")

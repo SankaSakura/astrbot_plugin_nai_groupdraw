@@ -1,6 +1,5 @@
 import asyncio
 import io
-import logging
 import os
 import hashlib
 import json
@@ -15,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import aiohttp
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, StarTools
@@ -156,7 +156,7 @@ class NovelAIGroupDraw(Star):
                     await api.post_group_message(group_openid=group, **payload)
                 return
             except Exception as error:
-                logging.getLogger(__name__).info("QQ menu fallback (%s)", type(error).__name__)
+                logger.info(f"QQ menu fallback ({type(error).__name__})")
         if all_commands:
             message += "\n\n" + "\n".join(command for row in rows for _, command in row)
         elif not draft_menu:
@@ -452,15 +452,15 @@ class NovelAIGroupDraw(Star):
             try:
                 await asyncio.to_thread(Gallery(self.gallery_root, owner.group_scope, owner.user if dm else None).save, key, images)
             except (OSError, sqlite3.Error) as error:
-                logging.getLogger(__name__).error("groupdraw %s: gallery save failed (%s)", key[:12], type(error).__name__)
+                logger.error(f"groupdraw {key[:12]}: gallery save failed ({type(error).__name__})")
                 try:
                     await say("原图未写入本群图库，请管理员检查 VPS 可用空间和目录权限。")
                 except Exception:
-                    logging.getLogger(__name__).warning("groupdraw %s: could not notify of gallery error", key[:12])
+                    logger.warning(f"groupdraw {key[:12]}: could not notify of gallery error")
             try:
                 code = self.drafts.remember(owner, draft, epoch)
             except sqlite3.Error:
-                logging.getLogger(__name__).warning("groupdraw %s: history write failed", key[:12])
+                logger.warning(f"groupdraw {key[:12]}: history write failed")
                 code = None
             api = getattr(getattr(event, "bot", None), "api", None)
             raw = getattr(event.message_obj, "raw_message", None)
@@ -479,7 +479,7 @@ class NovelAIGroupDraw(Star):
                     if content_rejected(error):
                         await self.delivery_notice(event, api, group, mid, key, error)
                         return
-                    logging.getLogger(__name__).warning("groupdraw %s: QQ card fallback (%s)", key[:12], type(error).__name__)
+                    logger.warning(f"groupdraw {key[:12]}: QQ card fallback ({type(error).__name__})")
             try:
                 await event.send(event.chain_result([Image.fromBytes(image)]))
                 if dm and code:
@@ -533,8 +533,7 @@ class NovelAIGroupDraw(Star):
                     else:
                         await send_archive(api, owner.group, mid, output, size, f"本群图库-{count}张.zip")
                 except Exception as error:
-                    logging.getLogger(__name__).warning("QQ gallery delivery failed (%s; %d bytes)",
-                                                       type(error).__name__, size)
+                    logger.warning(f"QQ gallery delivery failed ({type(error).__name__}; {size} bytes)")
                     if dm:
                         self.check_binding(binding,dm)
                         raise ValueError("QQ 未确认私聊文件送达，原图仍在你的私聊图库。") from error
@@ -547,19 +546,18 @@ class NovelAIGroupDraw(Star):
         rejected = content_rejected(error)
         reason = "QQ 内容审核未通过。" if rejected else "群消息发送失败。"
         text = "图片已生成，但未能送达：" + reason
-        log = logging.getLogger(__name__)
-        log.warning("groupdraw %s: delivery failed (%s)", key[:12],
-                    "QQ content rejected" if rejected else type(error).__name__)
+        detail = "QQ content rejected" if rejected else type(error).__name__
+        logger.warning(f"groupdraw {key[:12]}: delivery failed ({detail})")
         try:
             if event.get_group_id() and api and mid and hasattr(api, "post_group_message"):
                 result = await api.post_group_message(group_openid=group, msg_id=mid, msg_seq=4,
                                                       msg_type=0, content=text)
                 if result is None:
-                    log.warning("groupdraw %s: failure notice unconfirmed", key[:12])
+                    logger.warning(f"groupdraw {key[:12]}: failure notice unconfirmed")
             else:
                 await event.send(event.plain_result(text))
         except Exception as notice_error:
-            log.warning("groupdraw %s: failure notice failed (%s)", key[:12], type(notice_error).__name__)
+            logger.warning(f"groupdraw {key[:12]}: failure notice failed ({type(notice_error).__name__})")
 
     async def request_image(self, event, draft, key, owner, acknowledge, reference_body=None, binding=None, dm=None):
         user, group, group_scope = owner.user, owner.group, owner.group_scope
@@ -625,7 +623,7 @@ class NovelAIGroupDraw(Star):
                 self.budget.release(key)
                 raise
             try:
-                logging.getLogger(__name__).info("groupdraw %s: submitting to NovelAI", key[:12])
+                logger.info(f"groupdraw {key[:12]}: submitting to NovelAI")
                 image = await generate(token, payload)
             except Rejected:
                 self.budget.release(key)
@@ -636,7 +634,6 @@ class NovelAIGroupDraw(Star):
                 self.budget.complete(key)
             except sqlite3.Error:
                 # The committed reservation still counts from the submission time.
-                logging.getLogger(__name__).warning("groupdraw %s: quota timestamp update failed", key[:12])
-            logging.getLogger(__name__).info("groupdraw %s: received %d PNG(s), %d bytes",
-                                             key[:12], len(image), sum(map(len, image)))
+                logger.warning(f"groupdraw {key[:12]}: quota timestamp update failed")
+            logger.info(f"groupdraw {key[:12]}: received {len(image)} PNG(s), {sum(map(len, image))} bytes")
             return image

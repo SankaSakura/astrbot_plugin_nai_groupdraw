@@ -2,10 +2,10 @@
 import asyncio
 import base64
 import hashlib
-import logging
 from urllib.parse import quote, urlsplit
 
 import aiohttp
+from astrbot.api import logger
 
 from .menu import identifiers
 
@@ -77,7 +77,7 @@ async def require_group_admin(event, group, user, group_entries, global_admins=N
             lookup_note = "QQ 群成员查询失败"
             if code.isascii() and code.isdecimal() and len(code) <= 10:
                 lookup_note += f"（错误码 {code}）"
-            logging.getLogger(__name__).info("%s (%s)", lookup_note, type(error).__name__)
+            logger.info(f"{lookup_note} ({type(error).__name__})")
         else:
             if field(member, "member_openid") not in (None, member_id):
                 raise ValueError("QQ 返回的成员身份与发送者不符，操作未执行。")
