@@ -16,7 +16,17 @@ def build_request(drawing, original_request=None):
         old_seed = original_request["parameters"].get("seed")
         if seed == old_seed:
             seed = (seed + 1) % 2**32
-        return {**original_request, "parameters": {**original_request["parameters"], "seed": seed}}
+        params = {**original_request["parameters"], "seed": seed}
+        # v1.12.0–1 saved the UI's English name instead of the V5 wire value.
+        descriptions = params.get("director_reference_descriptions")
+        if descriptions:
+            descriptions = list(descriptions)
+            for index, item in enumerate(descriptions):
+                cap = item["caption"]
+                if cap.get("base_caption") == "outfit":
+                    descriptions[index] = {**item, "caption": {**cap, "base_caption": "costume"}}
+            params["director_reference_descriptions"] = descriptions
+        return {**original_request, "parameters": params}
     def caption(base, side):
         return {"base_caption": base, "char_captions": [
             {"char_caption": pair[side], "centers": [{"x": 0.5, "y": 0.5}]}

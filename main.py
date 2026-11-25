@@ -22,10 +22,10 @@ from .menu import Draft, ENTRY, FIELD, HELP, HELP_MARKDOWN, MULTILINE_EDIT, butt
 from .quota import Budget, group_limit, matching_groups, migrate_groups
 from .drafts import Drafts, GroupMember
 from .presets import Presets
-from .references import reference_parameters
+from .references import MODES, image_urls, inspect_quote, raw_message, reference_parameters
 from .qq_image import send_image_card
 from .gallery import Gallery
-from .qq_gallery import release_event_roles, require_group_admin, retain_event_roles, send_archive
+from .qq_gallery import field as message_field, release_event_roles, require_group_admin, retain_event_roles, send_archive
 
 class Rejected(ValueError):
     """Upstream confirmed it did not accept the request."""
@@ -119,8 +119,10 @@ class NovelAIGroupDraw(Star):
             notice = "出图预设：" + " → ".join(p["name"] for p in enabled)
             text += "\n" + notice
             markdown += "\n\n" + markdown_text(notice)
-        hint = "附图出图可选角色、画风、服装或角色+画风。无图直接发送即可。"
-        await self.menu(event, text, markdown + "\n\n" + hint, rows)
+        options = "、".join(f"`{mode}`" for mode in MODES)
+        hint = f"附图时，在 `参考模式：` 后填一项：{options}。无图直接发送即可。"
+        plain_hint = "参考模式可填：" + "、".join(MODES) + "。例如 /出图 参考模式：服装"
+        await self.menu(event, text + "\n" + plain_hint, markdown + "\n\n" + hint, rows)
 
     async def menu(self, event, message, paragraphs, rows=None, *, draft_menu=True, all_commands=False):
         send = getattr(getattr(getattr(event, "bot", None), "api", None), "post_group_message", None)
@@ -160,10 +162,20 @@ class NovelAIGroupDraw(Star):
         finally:
             event.stop_event()
 
-    @filter.regex(ENTRY)
+    @filter.regex(ENTRY + r"|^\s*\[引用消息[\s\S]*(?:测试引用|出图)")
     async def draw(self, event: AstrMessageEvent):
         group, user = str(event.get_group_id() or ""), str(event.get_sender_id() or "")
         text = event.message_str.strip()
+        if text.startswith("[引用消息"):
+            # Only the sender's current command can trigger a generation. The rendered
+            # outline includes quoted text, which can itself contain bot commands.
+            text = str(message_field(raw_message(event), "content") or "").strip()
+            text = re.sub(r"^<@!?[^>]+>\s*", "", text)
+            if not text:
+                from astrbot.api.message_components import Plain
+                text = "".join(p.text for p in event.message_obj.message if isinstance(p, Plain)).strip()
+            if not re.match(r"^[/／]?(?:测试引用|引用出图|出图)(?=\s|$)", text):
+                return
         match = re.match(ENTRY, text)
         if not group or not user or not match:
             return
@@ -200,6 +212,17 @@ class NovelAIGroupDraw(Star):
         self.seen[receipt] = now + 600
         say = lambda message: event.send(event.plain_result(message))
         try:
+            if action == "测试引用":
+                quote = inspect_quote(event)
+                if quote.problem:
+                    await say(f"引用测试：识别到 {len(quote.urls)} 个引用图片附件。{quote.problem}")
+                else:
+                    if self.lock.locked():
+                        raise ValueError("机器人正在处理图片，请稍后再测试。")
+                    async with self.lock:
+                        await reference_parameters(quote.urls, "")
+                    await say(f"引用测试通过：已读取本人两分钟内的 {len(quote.urls)} 张图片。请再次回复原图发送 /引用出图 参考模式：服装。")
+                return
             if action == "预设":
                 await self.menu(event, *self.presets.command(owner, body), draft_menu=False, all_commands=True)
                 return
@@ -262,7 +285,7 @@ class NovelAIGroupDraw(Star):
                 _, epoch = self.drafts.edit(owner)
                 from_card = bool(body) and action in ("原设置重画", "我的预设重画")
                 draft = self.drafts.recipe(owner, body, shared=from_card)
-            elif action == "出图":
+            elif action in ("出图", "引用出图"):
                 draft, epoch = self.drafts.edit(owner)
             else:
                 direction = DIRECTIONS.get(action) or (DIRECTIONS.get(body) if action == "画图" else None)
@@ -288,7 +311,8 @@ class NovelAIGroupDraw(Star):
                 draft.original_request = None
             key = hashlib.sha256(json.dumps(receipt).encode()).hexdigest()
             images = await self.request_image(event, draft, key, owner.group_scope, acknowledge=True,
-                                              reference_body=body if action == "出图" else None)
+                                              reference_body=body if action in ("出图", "引用出图") else None,
+                                              require_quote=action == "引用出图")
             image = images[0]
             try:
                 await asyncio.to_thread(Gallery(self.gallery_root, owner.group_scope).save, key, images)
@@ -370,7 +394,7 @@ class NovelAIGroupDraw(Star):
         except Exception as notice_error:
             log.warning("groupdraw %s: failure notice failed (%s)", key[:12], type(notice_error).__name__)
 
-    async def request_image(self, event, draft, key, group_scope, acknowledge, reference_body=None):
+    async def request_image(self, event, draft, key, group_scope, acknowledge, reference_body=None, require_quote=False):
         user = str(event.get_sender_id() or "")
         group = str(event.get_group_id() or "")
         if (not user or user in identifiers(self.config.get("blocked_users"))
@@ -404,12 +428,29 @@ class NovelAIGroupDraw(Star):
             try:
                 payload = build_request(draft.effective().drawing(), draft.original_request)
                 if reference_body is not None:
-                    payload["parameters"].update(await reference_parameters(event, reference_body))
+                    urls = [] if require_quote else image_urls(event)
+                    source = "本条附图"
+                    if not urls:
+                        quote = inspect_quote(event)
+                        if require_quote or quote.explicit:
+                            if quote.problem:
+                                raise ValueError("引用图片不可用：" + quote.problem + "。本次未出图。")
+                            urls = quote.urls
+                            source = "引用图片"
+                    payload["parameters"].update(await reference_parameters(urls, reference_body))
                 draft.original_request = payload
                 if acknowledge:
                     params = payload["parameters"]
-                    await event.send(event.plain_result(
-                        f"正在画{draft.direction} · V5 · {params['width']}×{params['height']} · {params['steps']} 步"))
+                    notice = f"正在画{draft.direction} · V5 · {params['width']}×{params['height']} · {params['steps']} 步"
+                    if reference_body is not None:
+                        descriptions = params.get("director_reference_descriptions", [])
+                        if descriptions:
+                            mode = descriptions[0]["caption"]["base_caption"]
+                            label = next(name for name, code in MODES.items() if code == mode)
+                            notice += f" · {label}参考 {len(descriptions)} 张（{source}）"
+                        else:
+                            notice += " · 本条消息未收到参考图"
+                    await event.send(event.plain_result(notice))
             except BaseException:
                 self.budget.release(key)
                 raise
