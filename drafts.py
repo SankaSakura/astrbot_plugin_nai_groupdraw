@@ -48,11 +48,9 @@ class Drafts:
             yield db
 
     def edit(self, member, direction=None, updates=None, replacement=None, replace_fields=None):
-        owner = member.draft_key
         with self.transaction() as db:
-            row = db.execute("SELECT data, epoch FROM draft WHERE owner=?", (owner,)).fetchone()
-            epoch = row[1] if row else 0
-            draft = replacement or (Draft(**json.loads(row[0])) if row else Draft())
+            draft, epoch = self.read(db, member)
+            draft = replacement or draft
             if direction:
                 draft.direction = direction
             if replace_fields is not None:
@@ -62,9 +60,18 @@ class Drafts:
                     draft.fields.pop(key, None)
                 else:
                     draft.fields[key] = value
-            db.execute("INSERT OR REPLACE INTO draft VALUES (?,?,?)",
-                       (owner, json.dumps(asdict(draft), ensure_ascii=False), epoch))
+            self.store(db, member, draft, epoch)
             return draft, (epoch, self.group_epoch(db, member))
+
+    @staticmethod
+    def read(db, member):
+        row = db.execute("SELECT data, epoch FROM draft WHERE owner=?", (member.draft_key,)).fetchone()
+        return (Draft(**json.loads(row[0])), row[1]) if row else (Draft(), 0)
+
+    @staticmethod
+    def store(db, member, draft, epoch):
+        db.execute("INSERT OR REPLACE INTO draft VALUES (?,?,?)",
+                   (member.draft_key, json.dumps(asdict(draft), ensure_ascii=False), epoch))
 
     @staticmethod
     def group_epoch(db, member):

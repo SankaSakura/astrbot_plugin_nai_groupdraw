@@ -133,24 +133,7 @@ class Presets:
             page = 1
             if verb in ("新建", "修改"):
                 changes = parse_fields(lines[1:])
-                if verb == "新建":
-                    preset = Preset("", arg, "", "")
-                else:
-                    preset = self.lookup(catalog, arg)
-                    if preset.key in OFFICIAL:
-                        raise ValueError("官方预设只读。可用 /预设 新建 另存为本群预设。")
-                preset = replace(preset, **changes)
-                if not preset.name or not (preset.positive or preset.negative):
-                    raise ValueError("请填写预设昵称，以及至少一栏正向或反向提示词。")
-                if any(p.name == preset.name and p.key != preset.key for p in catalog.values()):
-                    raise ValueError("本群已有同名预设，请换一个昵称。")
-                if preset.key:
-                    db.execute("UPDATE group_preset SET name=?,positive=?,negative=? WHERE scope=? AND id=?",
-                               (preset.name, preset.positive, preset.negative, member.group_scope, preset.key[1:]))
-                else:
-                    row = db.execute("INSERT INTO group_preset(scope,name,positive,negative) VALUES (?,?,?,?)",
-                                     (member.group_scope, preset.name, preset.positive, preset.negative))
-                    preset = replace(preset, key=f"G{row.lastrowid}")
+                preset = self.save_group_preset(db, member, catalog, arg if verb == "修改" else None, arg, changes)
                 return self.detail(preset, selected)
             if len(lines) > 1:
                 raise ValueError("请每次发送一条预设指令。")
@@ -168,6 +151,28 @@ class Presets:
                     raise ValueError("发送 /预设 打开列表，或用 /预设 详情 编号 查看内容。")
                 page = int(verb)
             return self.panel(catalog, selected, page)
+
+    @staticmethod
+    def save_group_preset(db, member, catalog, key, name, changes):
+        if key is None:
+            preset = Preset("", name, "", "")
+        else:
+            preset = Presets.lookup(catalog, key)
+            if preset.key in OFFICIAL:
+                raise ValueError("官方预设只读。可用 /预设 新建 另存为本群预设。")
+        preset = replace(preset, **changes)
+        if not preset.name or not (preset.positive or preset.negative):
+            raise ValueError("请填写预设昵称，以及至少一栏正向或反向提示词。")
+        if any(p.name == preset.name and p.key != preset.key for p in catalog.values()):
+            raise ValueError("本群已有同名预设，请换一个昵称。")
+        if preset.key:
+            db.execute("UPDATE group_preset SET name=?,positive=?,negative=? WHERE scope=? AND id=?",
+                       (preset.name, preset.positive, preset.negative, member.group_scope, preset.key[1:]))
+        else:
+            row = db.execute("INSERT INTO group_preset(scope,name,positive,negative) VALUES (?,?,?,?)",
+                             (member.group_scope, preset.name, preset.positive, preset.negative))
+            preset = replace(preset, key=f"G{row.lastrowid}")
+        return preset
 
     @staticmethod
     def update_selection(db, member, selected, verb, keys):

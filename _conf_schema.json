@@ -95,6 +95,24 @@
     "default": "",
     "hint": "也可在环境变量 NOVELAI_TOKEN 中配置。"
   },
+  "deepseek_enabled": {
+    "type": "bool",
+    "description": "启用 /DS整理 和 /DS出图",
+    "default": false,
+    "hint": "仅指定指令会向 DeepSeek 官方 API 发送要求及相关草稿、预设信息。"
+  },
+  "deepseek_api_key": {
+    "type": "string",
+    "description": "DeepSeek API Key",
+    "default": "",
+    "hint": "也可在 VPS 设置 DEEPSEEK_API_KEY，环境变量优先。"
+  },
+  "deepseek_model": {
+    "type": "string",
+    "description": "DeepSeek 模型",
+    "default": "deepseek-flash",
+    "hint": "填写 DeepSeek 官方支持 JSON 输出的模型名称。"
+  },
   "buttons": {
     "type": "bool",
     "description": "发送 QQ 按钮菜单",

@@ -17,6 +17,7 @@ from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, StarTools
 
 from .drawing import DIRECTIONS, build_request
+from .deepseek import DeepSeek
 from .menu import Draft, ENTRY, FIELD, HELP, HELP_MARKDOWN, MULTILINE_EDIT, button_payload, field_key, identifiers, markdown_text, parse_draft
 
 from .quota import Budget, group_limit, matching_groups, migrate_groups
@@ -31,6 +32,8 @@ class Rejected(ValueError):
     """Upstream confirmed it did not accept the request."""
 
 ENDPOINT = "https://image.novelai.net/ai/generate-image"
+DS_ENTRY = r"^[/／](?i:DS)(整理|出图)(?=\s|$)"
+DS_CANDIDATE = r"^[/／]?(?i:DS)(?:整理|出图)(?=\s|$)"
 MAX_BYTES = 16 * 1024 * 1024
 
 def content_rejected(error):
@@ -86,6 +89,7 @@ class NovelAIGroupDraw(Star):
         self.budget = Budget(data / "budget.sqlite3")
         self.drafts = Drafts(data / "drafts.sqlite3")
         self.presets = Presets(self.drafts.transaction)
+        self.deepseek = DeepSeek(self.drafts)
         self.group_user_model = retain_event_roles()
 
     async def terminate(self):
@@ -162,26 +166,34 @@ class NovelAIGroupDraw(Star):
         finally:
             event.stop_event()
 
-    @filter.regex(ENTRY + r"|^\s*\[引用消息[\s\S]*(?:测试引用|出图)")
+    @filter.regex(ENTRY + "|" + DS_CANDIDATE + r"|^\s*\[引用消息[\s\S]*(?:测试引用|出图|(?i:DS)整理)")
     async def draw(self, event: AstrMessageEvent):
         group, user = str(event.get_group_id() or ""), str(event.get_sender_id() or "")
         text = event.message_str.strip()
-        if text.startswith("[引用消息"):
+        quoted = text.startswith("[引用消息")
+        if quoted or re.match(DS_CANDIDATE, text):
             # Only the sender's current command can trigger a generation. The rendered
             # outline includes quoted text, which can itself contain bot commands.
-            text = str(message_field(raw_message(event), "content") or "").strip()
-            text = re.sub(r"^<@!?[^>]+>\s*", "", text)
-            if not text:
+            current = message_field(raw_message(event), "content")
+            if isinstance(current, str):
+                text = re.sub(r"^(?:<@!?[^>]+>|<qqbot-at-user\b[^>]*?/>)\s*", "", current.strip())
+            elif quoted:
+                text = ""
+            if quoted and not text:
                 from astrbot.api.message_components import Plain
                 text = "".join(p.text for p in event.message_obj.message if isinstance(p, Plain)).strip()
-            if not re.match(r"^[/／]?(?:测试引用|出图)(?=\s|$)", text):
+                if re.match(DS_ENTRY, text):
+                    return
+            if not re.match(DS_ENTRY, text) and not (quoted and re.match(r"^[/／]?(?:测试引用|出图)(?=\s|$)", text)):
                 return
-        match = re.match(ENTRY, text)
+        ds = re.match(DS_ENTRY, text)
+        match = ds or re.match(ENTRY, text)
         if not group or not user or not match:
             return
         event.should_call_llm(False)
         try:
-            await self.handle(event, group, user, match.group(1), text[match.end():].strip())
+            action = ("DS" if ds else "") + match.group(1)
+            await self.handle(event, group, user, action, text[match.end():].strip())
         finally:
             event.stop_event()
 
@@ -283,7 +295,24 @@ class NovelAIGroupDraw(Star):
                     await self.show_draft(event, owner, draft, preview=False)
                 return
             original_settings = action in ("原设置重画", "再出一张", "再来一张")
-            if original_settings or action == "我的预设重画":
+            reference_body = body if action == "出图" else None
+            key = hashlib.sha256(json.dumps(receipt).encode()).hexdigest()
+            if action in ("DS整理", "DS出图"):
+                if not self.config.get("deepseek_enabled", False):
+                    raise ValueError("本插件尚未启用 DeepSeek。")
+                if not mid:
+                    raise ValueError("无法取得本条消息标识，请重新发送 DS 指令。")
+                editing = action == "DS整理"
+                prepared = await self.deepseek.prepare(self.config, owner, body, editing, key)
+                if (not self.config.get("deepseek_enabled", False) or not matching_groups(self.config, group)
+                        or user in identifiers(self.config.get("blocked_users"))):
+                    raise ValueError("当前群或账号没有 DS 使用权限。")
+                result = self.deepseek.execute(owner, body, editing, prepared)
+                if editing:
+                    await say(result)
+                    return
+                draft, epoch, reference_body = result
+            elif original_settings or action == "我的预设重画":
                 _, epoch = self.drafts.edit(owner)
                 from_card = bool(body) and action in ("原设置重画", "我的预设重画")
                 draft = self.drafts.recipe(owner, body, shared=from_card)
@@ -308,12 +337,11 @@ class NovelAIGroupDraw(Star):
                     await self.show_draft(event, owner, draft, page=page, edited_role=edited_role)
                     return
                 draft, epoch = self.drafts.edit(owner, replacement=parse_draft(body))
-            if not original_settings:
+            if not original_settings and action != "DS出图":
                 draft.presets = self.presets.snapshot(owner)
                 draft.original_request = None
-            key = hashlib.sha256(json.dumps(receipt).encode()).hexdigest()
             images = await self.request_image(event, draft, key, owner.group_scope, acknowledge=True,
-                                              reference_body=body if action == "出图" else None)
+                                              reference_body=reference_body)
             image = images[0]
             try:
                 await asyncio.to_thread(Gallery(self.gallery_root, owner.group_scope).save, key, images)
