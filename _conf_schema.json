@@ -5,6 +5,12 @@
     "default": 100,
     "hint": "每个白名单群分别计数。未单独设置的群使用此值，0 表示暂停。"
   },
+  "global_admins": {
+    "type": "text",
+    "description": "总管理员",
+    "default": "",
+    "hint": "在群里 @机器人 发送 /群标识，复制「你的用户标识」，每行填一人。总管理员可以在所有白名单群导出或清空当前群的图库、清空当前群的提示词记录。"
+  },
   "groups": {
     "type": "template_list",
     "description": "群白名单",

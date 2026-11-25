@@ -230,7 +230,8 @@ class NovelAIGroupDraw(Star):
                 if body:
                     await say(f"请单独发送 /{action}。")
                     return
-                api, permission = await require_group_admin(event, group, user, group_entries)
+                api, permission = await require_group_admin(
+                    event, group, user, group_entries, self.config.get("global_admins"))
                 if action == "图库权限":
                     await say(permission + "，可以导出图库、清空图库和清空提示词记录。")
                     return

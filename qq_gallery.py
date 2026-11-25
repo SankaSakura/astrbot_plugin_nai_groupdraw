@@ -55,7 +55,7 @@ async def qq_request(api, method, path, **kwargs):
     return await api._http.request(Route(method, path), **kwargs)
 
 
-async def require_group_admin(event, group, user, group_entries):
+async def require_group_admin(event, group, user, group_entries, global_admins=None):
     raw = getattr(event.message_obj, "raw_message", None)
     payload = field(raw, "d") or raw
     author = field(payload, "author")
@@ -64,6 +64,8 @@ async def require_group_admin(event, group, user, group_entries):
     if (not api or field(payload, "group_openid") != group
             or not member_id or user not in (member_id, field(author, "id"))):
         raise ValueError("无法核实你在本群的 QQ 身份，操作未执行。")
+    if user in identifiers(global_admins):
+        return api, "你是插件总管理员"
     role = field(author, "member_role")
     lookup_note = "QQ 未返回可识别的群角色"
     if role not in ("owner", "admin", "member"):
@@ -83,7 +85,7 @@ async def require_group_admin(event, group, user, group_entries):
     if role in ("owner", "admin"):
         return api, "QQ 已识别你为本群" + ("群主" if role == "owner" else "管理员")
     if role == "member":
-        raise ValueError("只有本群群主或管理员可以操作图库。")
+        raise ValueError("只有插件总管理员、本群群主或管理员可以执行此操作。")
     if len(group_entries) == 1 and user in identifiers(group_entries[0].get("gallery_admins")):
         return api, "你已获得本群手动授权的图库管理权限"
     raise ValueError(f"{lookup_note}，操作未执行。可发送 /群标识，再请机器人管理员将你的用户标识填入本群的「图库管理员」并保存。")
